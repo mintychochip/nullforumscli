@@ -227,7 +227,7 @@ class NetworkError(NfError):
     code = "NETWORK_ERROR"
 ```
 
-- [ ] **Step 7: Create `src/nf/__init__.py` and a placeholder `README.md`**
+- [ ] **Step 7: Create `src/nf/__init__.py` and an initial `README.md`**
 
 `src/nf/__init__.py`:
 
@@ -316,13 +316,16 @@ def test_redact_is_a_noop_without_a_cookie(tmp_path):
     assert cfg.redact("plain message") == "plain message"
 
 
-def test_redact_ignores_short_values_to_avoid_mangling_text(tmp_path):
+def test_redact_ignores_short_values_to_avoid_mangling_text():
+    """Short values are not individually redacted, or ordinary text gets mangled."""
     cfg = Config(
-        base_url="https://x.test", cookie="a=1", user_agent="nf/0",
+        base_url="https://x.test", cookie=f"a=1; xf_user={SECRET_USER}",
+        user_agent="nf/0",
         rate_limit_ms=1, cache_ttl_s=1,
         cache_dir=Path("/tmp/c"), state_dir=Path("/tmp/s"),
     )
     assert cfg.redact("a=1 in text") == "a=1 in text"
+    assert SECRET_USER not in cfg.redact(f"token {SECRET_USER}")
 
 
 def test_default_user_agent_shape():
@@ -474,7 +477,7 @@ git commit -m "feat: config resolution and tested cookie redaction"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `classify_request(path: str) -> str` returning one of `thread`, `resource`, `category`, `index`, `robots`, `other`. `parse_doc_url(url: str) -> DocRef | None` where `DocRef` is a frozen dataclass `(type: str, id: int, slug: str)`; `type` is one of `thread`, `resource`, `tag`, `forum`. `slug_to_title(slug: str) -> str`. `doc_url(base_url: str, ref: DocRef) -> str`.
+- Produces: `classify_request(path: str) -> str` returning one of `thread`, `resource`, `category`, `index`, `robots`, `other`. `parse_doc_url(url: str) -> DocRef | None` where `DocRef` is a frozen dataclass `(type: str, id: int, slug: str)`; `type` is one of `thread`, `resource`, `tag`, `forum`. `slug_to_title(slug: str) -> str`. URLs are rebuilt by callers from the stored `url` field, not from a helper, so no `doc_url` is provided.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -605,14 +608,6 @@ def slug_to_title(slug: str) -> str:
     """Approximate a title from a slug. Slugs are lossy; callers must mark it."""
     words = [w for w in slug.split("-") if w]
     return " ".join(w[:1].upper() + w[1:] for w in words)
-
-
-def doc_url(base_url: str, ref: DocRef) -> str:
-    kind = {"thread": "threads", "resource": "resources",
-            "tag": "tags", "forum": "forums"}[ref.type]
-    if ref.type == "tag":
-        return f"{base_url}/{kind}/{ref.slug}/"
-    return f"{base_url}/{kind}/{ref.slug}.{ref.id}/"
 ```
 
 Note: `/resources/categories/minecraft-plugins.38/` intentionally parses as a
@@ -874,7 +869,8 @@ def assert_allowed(policy: RobotsPolicy, url: str) -> None:
         pattern = rule.pattern if rule else "/"
         raise RobotsRefusal(
             f"robots.txt disallows {path} (rule: Disallow: {pattern})",
-            hint="this client only reads paths the site permits; see spec section 2",
+            hint=f"matched robots group {policy.source_agent!r}; this client only reads "
+                 "paths the site permits (spec section 2)",
         )
 ```
 
@@ -1141,9 +1137,10 @@ class Ledger:
         }
 ```
 
-Note: a robots refusal is recorded by the CLI when it catches `RobotsRefusal`, and
-counted separately from requests — a refusal never became a request, so it must not
-inflate `requests.total` or the cache stats. The test above pins that.
+Note: a robots refusal is recorded by `http.Client.get` when the gate raises, and counted
+separately from requests — a refusal never became a request, so it must not inflate
+`requests.total` or the cache stats. Both the ledger test above and Task 6's gate test
+pin that.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1231,10 +1228,13 @@ def test_gate_refuses_disallowed_before_any_request(tmp_path):
         seen.append(str(request.url))
         return httpx.Response(200, text=ROBOTS_BODY)
 
-    client, _, _ = make_client(tmp_path, handler)
+    client, _, led = make_client(tmp_path, handler)
     with pytest.raises(RobotsRefusal):
         client.get("https://nullforums.net/search/?q=x")
     assert seen == [ROBOTS]      # robots fetched, target never requested
+    refusal = led.entries()[-1]
+    assert refusal["refusal"] == "/search/"
+    assert led.rollup("all", 1000)["requests"]["total"] == 1   # robots only
 
 
 def test_successful_fetch_returns_body(tmp_path):
@@ -1248,7 +1248,8 @@ def test_successful_fetch_returns_body(tmp_path):
     assert res.status == 200
     assert "ok" in res.text
     assert res.from_cache is False
-    assert led.entries()[0]["pathClass"] == "thread"
+    # The robots fetch is ledgered first, so the target is the LAST entry.
+    assert led.entries()[-1]["pathClass"] == "thread"
 
 
 def test_second_fetch_comes_from_cache(tmp_path):
@@ -1457,11 +1458,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 import httpx
 
 from nf.config import Config
-from nf.errors import EdgeBlocked, NetworkError, RateLimited
+from nf.errors import EdgeBlocked, NetworkError, RateLimited, RobotsRefusal
 from nf.paths import classify_request
 from nf.robots import RobotsPolicy, assert_allowed
 from nf.usage import Ledger
@@ -1648,7 +1650,14 @@ class Client:
         raise NetworkError(f"request to {url} failed: {last_error!r}")
 
     def get(self, url: str, *, no_cache: bool = False, refresh: bool = False) -> FetchResult:
-        assert_allowed(self._robots(), url)
+        try:
+            assert_allowed(self._robots(), url)
+        except RobotsRefusal:
+            # A refusal never became a request; ledger it separately so it
+            # shows in `nf usage` without inflating the request count.
+            if self.ledger:
+                self.ledger.record_refusal(urlsplit(url).path or "/")
+            raise
         path_class = classify_request(url)
 
         if not no_cache and not refresh:
@@ -1700,9 +1709,11 @@ git commit -m "feat: HTTP client with robots gate, throttle, retry, cache, block
 **Interfaces:**
 - Consumes: nothing.
 - Produces: `SCHEMA_VERSION = 1`; `envelope(payload: dict) -> dict`; dataclasses
-  `Author`, `Node`, `Pagination`, `Post`, `Thread`, `CategoryRef`, `Resource`,
-  `ResourceItem`, `ResourceList`, `SearchHit`; `render.render(payload: dict, fmt: str, kind: str) -> str`
+  `Author`, `Pagination`, `Post`, `Thread`, `CategoryRef`, `Resource`,
+  `ResourceItem`, `ResourceList`; `render.render(payload: dict, fmt: str, kind: str) -> str`
   where `kind` is one of `thread`, `resource`, `category`, `search`, `usage`, `whoami`.
+  Search hits are plain dicts (spec section 8.1), not a dataclass: `nf search` never
+  needs the extra type, and a dataclass nothing constructs is dead weight.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1870,20 +1881,6 @@ class ResourceList:
     pagination: Pagination = field(default_factory=Pagination)
 
 
-@dataclass
-class SearchHit:
-    type: str = ""
-    id: int = 0
-    slug: str = ""
-    title: str = ""
-    titleSource: str = "slug"
-    url: str = ""
-    lastmod: str | None = None
-    score: float = 0.0
-    resource: Resource | None = None
-    thread: Thread | None = None
-
-
 def to_dict(model) -> dict:
     return asdict(model)
 ```
@@ -2038,12 +2035,30 @@ git commit -m "feat: data models, schema envelope, and renderers"
 ```bash
 cd /home/jlo/dev/nullforumscli
 mkdir -p tests/fixtures
-UA='Mozilla/5.0 (compatible; nf-fixture-capture)'
-cp /tmp/nf_thread.html tests/fixtures/thread-89951.html
-cp /tmp/nf_res.html    tests/fixtures/resource-8953.html
-cp /tmp/nf_cat.html    tests/fixtures/category-38.html
+UF='Mozilla/5.0 (compatible; nf-fixture-capture)'
+
+# Prefer copies already fetched during design; re-fetch if /tmp was cleared.
+cp /tmp/nf_thread.html tests/fixtures/thread-89951.html 2>/dev/null || \
+  curl -sS -A "$UF" -o tests/fixtures/thread-89951.html \
+    'https://nullforums.net/threads/trending-and-latest-posts-api.89951/'
+cp /tmp/nf_res.html tests/fixtures/resource-8953.html 2>/dev/null || \
+  curl -sS -A "$UF" -o tests/fixtures/resource-8953.html \
+    'https://nullforums.net/resources/advancedkits.8953/'
+cp /tmp/nf_cat.html tests/fixtures/category-38.html 2>/dev/null || \
+  curl -sS -A "$UF" -o tests/fixtures/category-38.html \
+    'https://nullforums.net/resources/categories/minecraft-plugins.38/'
+
+# Sanity: every fixture must be a real page, not a block or an error.
+for f in tests/fixtures/*.html; do
+  printf '%-40s %8s bytes  ' "$f" "$(wc -c < "$f")"
+  grep -q -i 'just a moment\|challenge-platform' "$f" && echo 'BLOCKED' || echo ok
+done
 shasum -a 256 tests/fixtures/*.html
 ```
+
+Every fixture MUST report `ok`. A `BLOCKED` fixture means the capture was refused at the
+edge; re-run with the honest user agent (not `curl`'s default, which the site 403s) before
+writing any parser against it.
 
 Record the shasums in `tests/fixtures/README.md` along with the source URL and fetch
 date for each file. Fixtures are the ground truth for the parsers; a silent change to
@@ -2365,12 +2380,22 @@ def raise_if_walled(html: str) -> None:
         )
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
+- [ ] **Step 6: Create `src/nf/parse/__init__.py`**
+
+```python
+"""Page parsers. Pure: HTML in, model out, no I/O."""
+```
+
+Deliberately exports nothing yet: `page.py` holds only helpers, and there is no parser to
+export until Tasks 9 and 10. Both of those replace this file with the version that
+re-exports `parse_thread`, `parse_resource`, and `parse_listing`.
+
+- [ ] **Step 7: Run the test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/test_parse_page.py -v`
 Expected: 17 passed
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/nf/parse tests/fixtures tests/test_parse_page.py
@@ -2461,8 +2486,8 @@ from __future__ import annotations
 import re
 
 from nf.errors import ParseFailure
-from nf.model import Author, Pagination, Post, Thread
-from nf.parse.page import (breadcrumbs, clean_text, iso_time, node_of, pagination,
+from nf.model import Author, Post, Thread
+from nf.parse.page import (clean_text, iso_time, node_of, pagination,
                            require, scrub_attachments, title_of, tree)
 
 _ID_IN_URL = re.compile(r"\.(\d+)(?:/|$)")
@@ -2526,8 +2551,6 @@ def parse_thread(html: str, url: str, base_url: str = "https://nullforums.net") 
 
     node = node_of(t)
     page = pagination(t)
-    if not isinstance(page, Pagination):
-        page = Pagination()
 
     first = t.css_first("time.u-dt")
     return Thread(
@@ -2732,12 +2755,13 @@ def parse_resource(html: str, url: str, base_url: str = "https://nullforums.net"
     if desc is not None:
         link = desc.css_first("a.username")
         if link is not None:
+            attrs = link.attributes or {}
+            raw_id = str(attrs.get("data-user-id", ""))
+            href = attrs.get("href") or ""
             author = Author(
                 username=clean_text(link.text()) or None,
-                userId=int(link.attributes["data-user-id"])
-                if str((link.attributes or {}).get("data-user-id", "")).isdigit() else None,
-                url=(lambda h: h if h.startswith("http") else base_url + h)(
-                    (link.attributes or {}).get("href") or ""),
+                userId=int(raw_id) if raw_id.isdigit() else None,
+                url=href if href.startswith("http") else (base_url + href if href else None),
             )
 
     category = None
@@ -2758,6 +2782,8 @@ def parse_resource(html: str, url: str, base_url: str = "https://nullforums.net"
     created = times[0] if times else None
     updated = times[-1] if times else None
 
+    tagline_node = t.css_first(".structItem-resourceTagLine")
+
     thread = None
     for link in t.css('a[href*="/threads/"]'):
         href = (link.attributes or {}).get("href") or ""
@@ -2774,8 +2800,7 @@ def parse_resource(html: str, url: str, base_url: str = "https://nullforums.net"
         title=title,
         author=author,
         version=version,
-        tagLine=clean_text((t.css_first(".structItem-resourceTagLine") or _null()).text())
-        if t.css_first(".structItem-resourceTagLine") is not None else None,
+        tagLine=clean_text(tagline_node.text()) if tagline_node is not None else None,
         description={"html": body_html, "text": body_text},
         createdAt=created,
         lastUpdated=updated,
@@ -2783,19 +2808,7 @@ def parse_resource(html: str, url: str, base_url: str = "https://nullforums.net"
         discussionThread=thread,
         tags=[clean_text(a.text()) for a in t.css(".tagList a")],
     )
-
-
-class _null:
-    @staticmethod
-    def text() -> str:
-        return ""
 ```
-
-Placement note: `_null` is a small sentinel used to keep the `tagLine` expression from
-needing a second lookup. If the reviewer prefers, assign
-`tagline_node = t.css_first(".structItem-resourceTagLine")` once and use
-`clean_text(tagline_node.text()) if tagline_node else None` — that is clearer and should
-be preferred over `_null` if there is any doubt.
 
 - [ ] **Step 4: Implement `src/nf/parse/listing.py`**
 
@@ -2807,7 +2820,7 @@ from __future__ import annotations
 import re
 
 from nf.errors import ParseFailure
-from nf.model import Author, Pagination, ResourceItem, ResourceList
+from nf.model import Author, ResourceItem, ResourceList
 from nf.parse.page import clean_text, iso_time, pagination as read_pagination, require, tree
 
 _ID_IN_URL = re.compile(r"\.(\d+)(?:/|$)")
@@ -2866,8 +2879,6 @@ def parse_listing(html: str, url: str, base_url: str = "https://nullforums.net")
     heading = t.css_first(".p-title-value") or t.css_first("h1")
     id_match = _ID_IN_URL.search(url)
     page = read_pagination(t)
-    if not isinstance(page, Pagination):
-        page = Pagination()
     return ResourceList(
         id=int(id_match.group(1)) if id_match else None,
         url=url,
@@ -2912,7 +2923,7 @@ git commit -m "feat: resource and category listing parsers"
 - Test: `tests/test_index.py`
 
 **Interfaces:**
-- Consumes: `Client`, `nf.paths.parse_doc_url`/`slug_to_title`/`doc_url`, `nf.config.Config`.
+- Consumes: `Client`, `nf.paths.parse_doc_url`/`slug_to_title`, `nf.config.Config`.
 - Produces: `shard_urls(index_xml: str) -> list[tuple[str, str | None]]`;
   `iter_shard(xml_text: str) -> Iterator[dict]`; `Index(db_path)` with
   `upsert_many(rows)`, `count()`, `search(query, types, since, limit) -> list[dict]`,
@@ -2965,9 +2976,15 @@ def test_iter_shard_classifies_and_titles():
 
 
 def test_iter_shard_skips_category_listings():
-    xml = (FIX / "sitemap-shard.xml").read_text(encoding="utf-8")
-    for row in iter_shard(xml):
-        assert not row["slug"].startswith("categories/")
+    """Inline XML, because the trimmed fixture has no categories URL to exercise this."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://nullforums.net/resources/categories/minecraft-plugins.38/</loc></url>
+  <url><loc>https://nullforums.net/resources/advancedkits.8953/</loc></url>
+</urlset>
+"""
+    rows = list(iter_shard(xml))
+    assert [r["id"] for r in rows] == [8953]
 
 
 def test_upsert_is_idempotent_and_updates(tmp_path):
@@ -3112,7 +3129,7 @@ from typing import Callable, Iterable, Iterator
 
 from nf.config import Config
 from nf.errors import ParseFailure
-from nf.paths import DocRef, doc_url, parse_doc_url, slug_to_title
+from nf.paths import parse_doc_url, slug_to_title
 
 SITEMAP_INDEX = "/sitemap.xml"
 _SM = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
@@ -3441,7 +3458,7 @@ import sys
 import typer
 
 from nf.config import Config, load_config
-from nf.errors import NfError, RobotsRefusal, UsageError
+from nf.errors import NfError, UsageError
 from nf.http import Client
 from nf.index import DEFAULT_SEARCH_TYPES, SITEMAP_INDEX, build, open_index
 from nf.model import to_dict
@@ -3454,7 +3471,6 @@ from nf.usage import Ledger
 app = typer.Typer(add_completion=False, help="Headless read-only reader for nullforums.net.")
 
 FORMAT_HELP = "Output format: json (default), md, text."
-_robots_refusals = 0
 
 
 def _web(url_or_id: str, kind: str, base_url: str) -> str:
@@ -3467,8 +3483,9 @@ def _web(url_or_id: str, kind: str, base_url: str) -> str:
     return f"{base_url}/{prefix}/x.{url_or_id}/"
 
 
-@functools.lru_cache(maxsize=1)
 def _config() -> Config:
+    """Load config per call. One process runs one command, so caching buys
+    nothing and a module-level cache would make the CLI untestable."""
     return load_config()
 
 
@@ -3643,9 +3660,7 @@ def usage(window: str = typer.Option("24h", "--window", help="1h, 24h, or all"),
           format: str = typer.Option("json", "--format", help=FORMAT_HELP)) -> None:
     """Report this client's own request usage from the local ledger."""
     cfg = _config()
-    stats = Ledger(cfg.state_dir).rollup(window, limit_ms=cfg.rate_limit_ms)
-    stats["refusals"]["robots"] = _robots_refusals
-    _emit(stats, format, "usage")
+    _emit(Ledger(cfg.state_dir).rollup(window, limit_ms=cfg.rate_limit_ms), format, "usage")
 
 
 def main() -> None:
@@ -3720,7 +3735,7 @@ Task 1; §9 ledger → Task 5; §10 verification → Tasks 3 (fixtures), 12 (liv
 metadata columns instead, because contentless-external FTS5 requires trigger maintenance
 and rowid bookkeeping whose failure mode is a silently stale index. The plan's version
 is simpler and its `upsert_many` is idempotent-tested. The spec's schema block should be
-updated to match, and `SearchHit.type`'s default filter is now `thread,resource`.
+updated to match, and search defaults to the `thread` and `resource` types.
 
 **Known gaps, stated rather than hidden.** `whoami`'s logged-in check keys on the
 presence of a logout affordance in the page; if the theme hides it, `whoami` will report
