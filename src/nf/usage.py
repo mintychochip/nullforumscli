@@ -98,17 +98,7 @@ class Ledger:
         if window == "all":
             rows = all_rows
         else:
-            # For windowed rollups the reference "now" is the newest recorded
-            # timestamp, because the ledger itself is the only clock we have.
-            now: datetime | None = None
-            for row in reversed(all_rows):
-                try:
-                    now = datetime.fromisoformat(row["ts"])
-                    break
-                except (KeyError, ValueError):
-                    continue
-            if now is None:
-                now = self._clock()
+            now = self._clock()
             if now.tzinfo is None:
                 now = now.replace(tzinfo=timezone.utc)
             rows = [r for r in all_rows if self._in_window(r, window, now)]

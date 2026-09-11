@@ -7,8 +7,15 @@ T0 = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
 
 def make_ledger(tmp_path, times):
     """times: list of offsets in minutes from T0."""
-    it = iter(times)
-    return Ledger(tmp_path, clock=lambda: T0 + timedelta(minutes=next(it)))
+    seq = list(times)
+    idx = [0]
+
+    def clock():
+        pos = min(idx[0], len(seq) - 1)
+        idx[0] += 1
+        return T0 + timedelta(minutes=seq[pos])
+
+    return Ledger(tmp_path, clock=clock)
 
 
 def test_record_writes_one_jsonl_line_per_request(tmp_path):
