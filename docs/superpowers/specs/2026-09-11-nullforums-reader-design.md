@@ -168,12 +168,21 @@ site's own sitemap.
 5. Upsert into SQLite at `~/.cache/nullforums/index.sqlite`:
 
 ```sql
-CREATE TABLE docs (type TEXT, id INTEGER, slug TEXT, title TEXT, lastmod TEXT,
-                   PRIMARY KEY (type, id));
-CREATE VIRTUAL TABLE docs_fts USING fts5(title, content='docs',
-                                         content_rowid='rowid',
-                                         tokenize='porter unicode61');
+CREATE VIRTUAL TABLE docs USING fts5(
+    type UNINDEXED, id UNINDEXED, slug UNINDEXED, title, url UNINDEXED,
+    lastmod UNINDEXED, tokenize='porter unicode61'
+);
+CREATE TABLE shards (url TEXT PRIMARY KEY, lastmod TEXT);
 ```
+
+A single FTS5 table carries both the text and the metadata, rather than an external-content
+table with triggers. Contentless-external FTS5 requires trigger maintenance and rowid
+bookkeeping, and its failure mode is a silently stale index; `upsert_many` here is
+delete-then-insert and is tested to be idempotent. `lastmod` is stored with `UNINDEXED`
+so date filters can use it without it polluting relevance scoring.
+
+Search defaults to `thread,resource`. Tags, forums, and other node types are indexable
+and selectable with `--type`, but are not returned by default.
 
 **Query (`nf search <query>`):**
 
