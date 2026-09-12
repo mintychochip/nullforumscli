@@ -68,3 +68,8 @@ which always prints HTML.
 - The tool does not download attachments, post content, log in, or modify
   the site. It only reads robots-allowed pages.
 - `nf` refuses robots-disallowed paths rather than working around the block.
+- Pages embed a session-bound `_xfToken` CSRF field in their HTML, and
+  `nf raw` prints page bodies verbatim (the disk cache stores them too, in a
+  mode-`0700` directory). The token is not the session cookie, and `nf` never
+  issues a `POST`, so it cannot replay the token — but if you are handing
+  `nf raw` output to something else, treat it as session-adjacent content.
