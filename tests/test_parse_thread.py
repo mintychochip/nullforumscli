@@ -48,7 +48,7 @@ def test_no_attachment_reference_survives_serialization(thread):
     import json
     blob = json.dumps(to_dict(thread))
     assert "/attachments/" not in blob
-
+    assert "download" not in blob.lower()
 
 def test_login_wall_raises_auth_required():
     html = (FIX / "SYNTHETIC-login-wall.html").read_text(encoding="utf-8", errors="replace")

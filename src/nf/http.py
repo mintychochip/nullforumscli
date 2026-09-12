@@ -212,7 +212,13 @@ class Client:
                     f"request to {current_url} failed: {exc.__class__.__name__}") from exc
 
             content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > MAX_BODY_BYTES:
+            cl_value = None
+            if content_length:
+                try:
+                    cl_value = int(content_length.strip())
+                except (ValueError, TypeError):
+                    cl_value = None
+            if cl_value is not None and cl_value > MAX_BODY_BYTES:
                 raise NetworkError(
                     f"response body exceeds {MAX_BODY_BYTES} bytes",
                     hint="the page or shard is larger than this client will fetch")

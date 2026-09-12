@@ -255,3 +255,15 @@ def test_robots_is_cached_across_clients(tmp_path):
     c2, _, _ = make_client(tmp_path, handler)
     c2.get(THREAD)
     assert calls.count("/robots.txt") == 1
+
+
+def test_malformed_content_length_is_ignored_and_fetch_succeeds(tmp_path):
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text=ROBOTS_BODY)
+        return httpx.Response(200, text=OK_BODY, headers={"Content-Length": "abc"})
+
+    client, _, _ = make_client(tmp_path, handler)
+    res = client.get(THREAD)
+    assert res.status == 200
+    assert res.text == OK_BODY
