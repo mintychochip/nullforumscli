@@ -3141,8 +3141,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
     type UNINDEXED, id UNINDEXED, slug UNINDEXED, title, url UNINDEXED,
     lastmod UNINDEXED, tokenize='porter unicode61'
 );
+CREATE TABLE IF NOT EXISTS doc_key (key TEXT PRIMARY KEY, doc_rowid INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS shards (url TEXT PRIMARY KEY, lastmod TEXT);
 """
+
+
+def doc_key(row: dict) -> str:
+    """Stable unique key for a document.
+
+    Threads/resources/forums have a real numeric id. Tags do not: the site's tag
+    URLs carry no id, so parse_doc_url yields id=0 for all of them, and every tag
+    would otherwise collide on (type, id). Tags are therefore keyed by slug.
+    """
+    if row["type"] == "tag" or not row["id"]:
+        return f"{row['type']}:{row['slug']}"
+    return f"{row['type']}:{row['id']}"
 
 
 def shard_urls(index_xml: str) -> list[tuple[str, str | None]]:
@@ -3206,13 +3219,28 @@ class Index:
     def upsert_many(self, rows: Iterable[dict]) -> int:
         count = 0
         for row in rows:
-            self.conn.execute("DELETE FROM docs WHERE type = ? AND id = ?",
-                              (row["type"], row["id"]))
-            self.conn.execute(
-                "INSERT INTO docs (type, id, slug, title, url, lastmod) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (row["type"], row["id"], row["slug"], row["title"],
-                 row["url"], row["lastmod"]))
+            key = doc_key(row)
+            found = self.conn.execute(
+                "SELECT doc_rowid FROM doc_key WHERE key = ?", (key,)).fetchone()
+            if found is not None:
+                # Delete by rowid (O(1)); searching by the UNINDEXED type/id
+                # columns would full-scan the FTS5 table on every row, making a
+                # full build O(N^2).
+                self.conn.execute("DELETE FROM docs WHERE rowid = ?", (found[0],))
+                self.conn.execute(
+                    "INSERT INTO docs (rowid, type, id, slug, title, url, lastmod) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (found[0], row["type"], row["id"], row["slug"], row["title"],
+                     row["url"], row["lastmod"]))
+            else:
+                cur = self.conn.execute(
+                    "INSERT INTO docs (type, id, slug, title, url, lastmod) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (row["type"], row["id"], row["slug"], row["title"],
+                     row["url"], row["lastmod"]))
+                self.conn.execute(
+                    "INSERT INTO doc_key (key, doc_rowid) VALUES (?, ?)",
+                    (key, cur.lastrowid))
             count += 1
         self.conn.commit()
         return count

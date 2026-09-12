@@ -172,14 +172,26 @@ CREATE VIRTUAL TABLE docs USING fts5(
     type UNINDEXED, id UNINDEXED, slug UNINDEXED, title, url UNINDEXED,
     lastmod UNINDEXED, tokenize='porter unicode61'
 );
+CREATE TABLE doc_key (key TEXT PRIMARY KEY, doc_rowid INTEGER NOT NULL);
 CREATE TABLE shards (url TEXT PRIMARY KEY, lastmod TEXT);
 ```
 
 A single FTS5 table carries both the text and the metadata, rather than an external-content
 table with triggers. Contentless-external FTS5 requires trigger maintenance and rowid
-bookkeeping, and its failure mode is a silently stale index; `upsert_many` here is
-delete-then-insert and is tested to be idempotent. `lastmod` is stored with `UNINDEXED`
+bookkeeping, and its failure mode is a silently stale index. `lastmod` is stored with `UNINDEXED`
 so date filters can use it without it polluting relevance scoring.
+
+`doc_key` is the upsert's identity map, and it is load-bearing twice over:
+
+- **Tags have no numeric id.** Their URLs carry none, so `parse_doc_url` yields `id=0` for
+  every tag and `(type, id)` is *not* unique — every tag would overwrite the previous one,
+  collapsing the site's ~11k tags to a single row. Tags are therefore keyed by `type:slug`;
+  threads, resources, and forums keep `type:id`.
+- **FTS5 columns declared `UNINDEXED` cannot be searched efficiently.** Resolving a row with
+  `DELETE ... WHERE type = ? AND id = ?` full-scans the FTS5 table, making a full build
+  O(N²) — measured at ~1.7 hours for ~163k documents. `doc_key.key` is a real SQLite index,
+  so the lookup is O(log n) and the delete is by `rowid`, which is O(1). The same build then
+  completes in seconds.
 
 Search defaults to `thread,resource`. Tags, forums, and other node types are indexable
 and selectable with `--type`, but are not returned by default.
