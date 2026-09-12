@@ -121,6 +121,8 @@ def scrub_attachments(fragment: str) -> str:
     if not fragment or not fragment.strip():
         return ""
     parser = HTMLParser(fragment)
+    for node in parser.css("script, style"):
+        node.decompose()
     for selector in _ATTACHMENT_SELECTORS:
         for node in parser.css(selector):
             attrs = node.attributes or {}
@@ -132,6 +134,21 @@ def scrub_attachments(fragment: str) -> str:
         if "attachment" in classes or "downloadButton" in classes:
             node.decompose()
     return _body_inner(parser)
+
+
+def extract_body(node) -> tuple[str, str]:
+    """Return (safeHtml, text) for a XenForo body node, with attachments/embedded scripts removed."""
+    if node is None:
+        return "", ""
+    raw = node.html or ""
+    if not raw.strip():
+        return "", ""
+    safe_html = scrub_attachments(raw)
+    if not safe_html:
+        return "", ""
+    safe_tree = HTMLParser(safe_html)
+    text = clean_text(safe_tree.body.text() if safe_tree.body else "")
+    return safe_html, text
 
 
 def detect_block(html: str) -> bool:

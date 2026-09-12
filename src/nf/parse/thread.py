@@ -6,8 +6,8 @@ import re
 
 from nf.errors import ParseFailure
 from nf.model import Author, Post, Thread
-from nf.parse.page import (clean_text, iso_time, node_of, pagination,
-                           require, scrub_attachments, title_of, tree)
+from nf.parse.page import (clean_text, extract_body, iso_time, node_of,
+                           pagination, require, title_of, tree)
 
 _ID_IN_URL = re.compile(r"\.(\d+)(?:/|$)")
 _POST_CONTENT = re.compile(r"post-(\d+)")
@@ -16,23 +16,6 @@ _POST_CONTENT = re.compile(r"post-(\d+)")
 def _id_from_url(url: str) -> int | None:
     m = _ID_IN_URL.search(url)
     return int(m.group(1)) if m else None
-
-
-def _body_inner(t) -> str:
-    html = (t.body.html if t.body else None) or ""
-    if html.startswith("<body"):
-        start = html.find(">")
-        end = html.rfind("</body>")
-        if start != -1 and end != -1:
-            html = html[start + 1:end].strip()
-    return html
-
-
-def _without_embedded(fragment: str) -> tuple[str, str]:
-    t = tree(fragment)
-    for node in t.css("script, style"):
-        node.decompose()
-    return _body_inner(t), clean_text(t.body.text() if t.body else "")
 
 
 def _author_of(article, base_url: str) -> Author:
@@ -66,27 +49,16 @@ def parse_posts(t, url: str, base_url: str) -> list[Post]:
             post_url = href if href.startswith("http") else base_url + href
         else:
             post_url = f"{url}#post-{post_id}" if post_id else None
-        if body is not None:
-            body_html, body_text = _without_embedded(body.html or "")
-            posts.append(Post(
-                id=post_id,
-                index=index,
-                url=post_url,
-                author=_author_of(article, base_url),
-                postedAt=iso_time((when.attributes or {}).get("datetime") if when else None),
-                bodyText=body_text,
-                bodyHtml=scrub_attachments(body_html),
-            ))
-        else:
-            posts.append(Post(
-                id=post_id,
-                index=index,
-                url=post_url,
-                author=_author_of(article, base_url),
-                postedAt=iso_time((when.attributes or {}).get("datetime") if when else None),
-                bodyText="",
-                bodyHtml="",
-            ))
+        body_html, body_text = extract_body(body)
+        posts.append(Post(
+            id=post_id,
+            index=index,
+            url=post_url,
+            author=_author_of(article, base_url),
+            postedAt=iso_time((when.attributes or {}).get("datetime") if when else None),
+            bodyText=body_text,
+            bodyHtml=body_html,
+        ))
     return posts
 
 
