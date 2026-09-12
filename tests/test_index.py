@@ -30,11 +30,9 @@ def test_iter_shard_classifies_and_titles():
     by_type = {}
     for row in rows:
         by_type[row["type"]] = by_type.get(row["type"], 0) + 1
-        assert row["id"] >= 0
         assert row["title"]
         assert row["url"].startswith("https://nullforums.net/")
-    assert by_type.get("thread", 0) > 0
-    assert by_type.get("resource", 0) > 0
+    assert by_type == {"forum": 3, "thread": 3, "resource": 3, "tag": 3}
 
 
 def test_iter_shard_skips_category_listings():
@@ -123,6 +121,17 @@ def test_search_escapes_fts_syntax(tmp_path):
          "url": "https://nullforums.net/threads/x.1/", "lastmod": "2026-01-01"},
     ])
     assert idx.search('"unbalanced AND OR', types=["thread"], since=None, limit=10) == []
+
+def test_operator_words_are_matched_literally(tmp_path):
+    """Quoting is what makes FTS operator words match as terms. Without it this
+    query is an FTS syntax error, so a non-empty result proves the quoting."""
+    idx = Index(tmp_path / "i.sqlite")
+    idx.upsert_many([
+        {"type": "thread", "id": 1, "slug": "not-alpha", "title": "Not Alpha Bot",
+         "url": "https://nullforums.net/threads/not-alpha.1/", "lastmod": "2026-01-01"},
+    ])
+    hits = idx.search("NOT alpha", types=["thread"], since=None, limit=10)
+    assert [h["id"] for h in hits] == [1]
 
 
 def test_shard_state_roundtrip(tmp_path):
