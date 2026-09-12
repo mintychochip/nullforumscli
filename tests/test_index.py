@@ -59,6 +59,31 @@ def test_upsert_is_idempotent_and_updates(tmp_path):
     assert idx.search("c", types=["thread"], since=None, limit=10)[0]["title"] == "A C"
 
 
+def test_distinct_tags_do_not_collide(tmp_path):
+    """Tags carry no numeric id (all id=0), so they must not key on (type, id)."""
+    idx = Index(tmp_path / "i.sqlite")
+    idx.upsert_many([
+        {"type": "tag", "id": 0, "slug": "minecraft", "title": "Minecraft",
+         "url": "https://nullforums.net/tags/minecraft/", "lastmod": "2026-01-01"},
+        {"type": "tag", "id": 0, "slug": "gwarppro", "title": "Gwarppro",
+         "url": "https://nullforums.net/tags/gwarppro/", "lastmod": "2026-01-01"},
+        {"type": "tag", "id": 0, "slug": "minecraft-plugins", "title": "Minecraft Plugins",
+         "url": "https://nullforums.net/tags/minecraft-plugins/", "lastmod": "2026-01-01"},
+    ])
+    assert idx.count() == 3
+    assert len(idx.search("minecraft", types=["tag"], since=None, limit=10)) == 2
+
+    # Re-upsert the two minecraft tags; the table must not grow and the two
+    # hits must remain visible.
+    idx.upsert_many([
+        {"type": "tag", "id": 0, "slug": "minecraft", "title": "Minecraft",
+         "url": "https://nullforums.net/tags/minecraft/", "lastmod": "2026-01-02"},
+        {"type": "tag", "id": 0, "slug": "minecraft-plugins", "title": "Minecraft Plugins",
+         "url": "https://nullforums.net/tags/minecraft-plugins/", "lastmod": "2026-01-02"},
+    ])
+    assert idx.count() == 3
+    assert len(idx.search("minecraft", types=["tag"], since=None, limit=10)) == 2
+
 def test_search_stems_words(tmp_path):
     idx = Index(tmp_path / "i.sqlite")
     idx.upsert_many([
