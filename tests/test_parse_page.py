@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from nf.errors import AuthRequired, ParseFailure
+from nf.errors import ParseFailure
 from nf.parse.page import (breadcrumbs, clean_text, detect_auth_wall, detect_block,
                            iso_time, node_of, pagination, require, scrub_attachments,
                            title_of, tree)

@@ -1,7 +1,7 @@
 import pytest
 
 from nf.errors import (
-    AuthRequired, EdgeBlocked, NfError, ParseFailure, RateLimited,
+    AuthRequired, EdgeBlocked, ParseFailure, RateLimited,
     RobotsRefusal, UsageError, NetworkError,
 )
 

@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from nf.usage import Ledger, MAX_LEDGER_BYTES
+from nf.usage import Ledger
 
 T0 = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
 

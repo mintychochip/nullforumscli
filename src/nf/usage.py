@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 MAX_LEDGER_BYTES = 10 * 1024 * 1024
 _WINDOWS = {"1h": timedelta(hours=1), "24h": timedelta(hours=24)}
