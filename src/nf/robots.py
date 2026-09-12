@@ -8,9 +8,10 @@ within it the longest matching pattern wins, and an ``Allow`` beats a
 
 from __future__ import annotations
 
+import posixpath
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from nf.errors import RobotsRefusal
 
@@ -27,6 +28,28 @@ def _compile(pattern: str) -> re.Pattern[str]:
     body = pattern[:-1] if anchored else pattern
     parts = [re.escape(p) for p in body.split("*")]
     return re.compile("^" + ".*".join(parts) + ("$" if anchored else ""))
+
+
+def _canonical_path(path_or_url: str) -> str:
+    if "://" in path_or_url or "?" in path_or_url:
+        path = urlsplit(path_or_url).path or "/"
+    else:
+        path = path_or_url
+    # Reject paths that try to smuggle a path separator through percent-encoding.
+    lower = path.lower()
+    if "%2f" in lower or "%5c" in lower:
+        return "/__REJECTED__"
+    # Preserve the trailing slash; robots patterns rely on it.
+    had_trailing = path.endswith("/") and len(path) > 1
+    # Decode, collapse duplicate slashes, and normalise . and .. segments.
+    path = unquote(path)
+    path = re.sub(r"/+", "/", path)
+    path = posixpath.normpath(path)
+    if had_trailing and not path.endswith("/"):
+        path = path + "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
 
 
 @dataclass
@@ -67,13 +90,12 @@ class RobotsPolicy:
                     rules.append((key == "allow", value))
         flush()
 
-        ua = user_agent.lower()
-        token = ua.split("/", 1)[0]
+        token = user_agent.split("/", 1)[0].lower()
         best_agent: str | None = None
         best_rules: list[tuple[bool, str]] = []
         for group_agents, group_rules in groups:
             for agent in group_agents:
-                if agent == "*" or agent == token or agent in ua:
+                if agent == "*" or agent == token:
                     if best_agent is None or (agent != "*" and len(agent) > len(best_agent)):
                         best_agent, best_rules = agent, group_rules
         if best_agent is None:
@@ -84,13 +106,9 @@ class RobotsPolicy:
         )
 
     def is_allowed(self, path: str) -> bool:
-        if "://" in path:
-            parts = urlsplit(path)
-            path = parts.path or "/"
-            if parts.query:
-                path = f"{path}?{parts.query}"
-        if not path.startswith("/"):
-            path = "/" + path
+        path = _canonical_path(path)
+        if path == "/__REJECTED__":
+            return False
         winner: _Rule | None = None
         for rule in self.rules:
             if not rule.regex.match(path):
@@ -101,6 +119,9 @@ class RobotsPolicy:
         return True if winner is None else winner.allow
 
     def matching_rule(self, path: str) -> _Rule | None:
+        path = _canonical_path(path)
+        if path == "/__REJECTED__":
+            return None
         winner: _Rule | None = None
         for rule in self.rules:
             if not rule.regex.match(path):
@@ -113,12 +134,11 @@ class RobotsPolicy:
 
 def assert_allowed(policy: RobotsPolicy, url: str) -> None:
     """Raise RobotsRefusal before any request is made for a disallowed path."""
-    path = urlsplit(url).path or "/"
     if not policy.is_allowed(url):
-        rule = policy.matching_rule(path)
+        rule = policy.matching_rule(_canonical_path(url))
         pattern = rule.pattern if rule else "/"
         raise RobotsRefusal(
-            f"robots.txt disallows {path} (rule: Disallow: {pattern})",
+            f"robots.txt disallows {urlsplit(url).path or '/'} (rule: Disallow: {pattern})",
             hint=f"matched robots group {policy.source_agent!r}; this client only reads "
                  "paths the site permits (spec section 2)",
         )

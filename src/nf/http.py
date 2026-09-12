@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
 from nf.config import Config
-from nf.errors import EdgeBlocked, NetworkError, RateLimited, RobotsRefusal
+from nf.errors import EdgeBlocked, NetworkError, RateLimited, RobotsRefusal, UsageError
 from nf.paths import classify_request
 from nf.robots import RobotsPolicy, assert_allowed
 from nf.usage import Ledger
@@ -29,9 +30,17 @@ MAX_REDIRECTS = 3
 BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 ROBOTS_TTL_S = 24 * 3600
 TIMEOUT_S = 20.0
+MAX_BODY_BYTES = 16 * 1024 * 1024
 
 BLOCK_MARKERS = ("just a moment", "attention required", "challenge-platform",
                  "enable javascript and cookies to continue", "cf-chl")
+
+
+def _same_origin(base: str, url: str) -> bool:
+    base_parts = urlsplit(base)
+    url_parts = urlsplit(url)
+    return (base_parts.scheme == url_parts.scheme
+            and base_parts.netloc == url_parts.netloc)
 
 
 @dataclass(frozen=True)
@@ -41,6 +50,7 @@ class FetchResult:
     text: str
     from_cache: bool
     nbytes: int
+    cache_age_seconds: float | None = None
 
 
 def _looks_blocked(status: int, text: str) -> bool:
@@ -67,25 +77,16 @@ class Client:
         self._policy: RobotsPolicy | None = None
         self._http = httpx.Client(
             transport=transport,
-            follow_redirects=True,
-            max_redirects=MAX_REDIRECTS,
+            follow_redirects=False,
             timeout=TIMEOUT_S,
             headers={
                 "User-Agent": cfg.user_agent,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             },
-            cookies=self._cookies(),
         )
         self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def _cookies(self) -> dict[str, str]:
-        jar: dict[str, str] = {}
-        for part in (self.cfg.cookie or "").split(";"):
-            name, _, value = part.strip().partition("=")
-            if name and value:
-                jar[name] = value
-        return jar
+        os.chmod(self.cfg.cache_dir, 0o700)
 
     def close(self) -> None:
         self._http.close()
@@ -112,9 +113,10 @@ class Client:
         key = hashlib.sha256(url.encode("utf-8")).hexdigest()
         base = self.cfg.cache_dir / "http"
         base.mkdir(parents=True, exist_ok=True)
+        os.chmod(base, 0o700)
         return base / f"{key}.html", base / f"{key}.meta.json"
 
-    def _read_cache(self, url: str, ttl_s: int) -> str | None:
+    def _read_cache(self, url: str, ttl_s: int) -> tuple[str, float] | None:
         body, meta = self._cache_paths(url)
         if not body.is_file() or not meta.is_file():
             return None
@@ -122,19 +124,32 @@ class Client:
             info = json.loads(meta.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        if self._clock() - float(info.get("stored_at", 0)) > ttl_s:
+        if time.time() - float(info.get("stored_at_wall", 0)) > ttl_s:
             return None
         try:
-            return body.read_text(encoding="utf-8")
+            text = body.read_text(encoding="utf-8")
         except OSError:
             return None
+        return text, float(info.get("stored_at_wall", 0))
+
+    def _atomic_write(self, path: Path, text: str) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
 
     def _write_cache(self, url: str, text: str) -> None:
         body, meta = self._cache_paths(url)
-        body.write_text(text, encoding="utf-8")
-        meta.write_text(json.dumps({"url_class": classify_request(url),
-                                    "stored_at": self._clock()}),
-                        encoding="utf-8")
+        now_mono = self._clock()
+        now_wall = time.time()
+        self._atomic_write(body, text)
+        self._atomic_write(meta, json.dumps({
+            "url_class": classify_request(url),
+            "stored_at_mono": now_mono,
+            "stored_at_wall": now_wall,
+        }))
 
     # ---- robots gate ----
 
@@ -142,46 +157,77 @@ class Client:
         if self._policy is not None:
             return self._policy
         url = f"{self.cfg.base_url}/robots.txt"
-        text = self._read_cache(url, ROBOTS_TTL_S)
+        cached = self._read_cache(url, ROBOTS_TTL_S)
+        text = cached[0] if cached is not None else None
         if text is None:
-            status, text, _ = self._raw_get(url, path_class="robots")
+            status, text, _, _ = self._raw_get(url)
             if status != 200:
                 raise NetworkError(
                     f"could not read robots.txt (status {status})",
                     hint="refusing to make requests without knowing the site's rules")
+        policy = RobotsPolicy.parse(text, self.cfg.user_agent)
+        if not policy.rules:
+            raise NetworkError("robots.txt contained no usable rules; refusing to proceed")
+        if cached is None:
             self._write_cache(url, text)
-        self._policy = RobotsPolicy.parse(text, self.cfg.user_agent)
+        self._policy = policy
         return self._policy
+
+    def assert_gated(self, url: str) -> None:
+        assert_allowed(self._robots(), url)
 
     # ---- requests ----
 
-    def _raw_get(self, url: str, *, path_class: str) -> tuple[int, str, int]:
-        """Send one request with retries. Returns (status, text, attempt)."""
+    def _raw_get(self, url: str) -> tuple[int, str, int, str]:
+        """Send one request with retries and manual same-origin redirects.
+
+        Returns (status, text, attempt, final_url). The caller receives the
+        original url; the final_url is used for cache storage.
+        """
+        if not _same_origin(self.cfg.base_url, url):
+            raise UsageError(
+                f"refusing to fetch a URL outside the configured origin "
+                f"({urlsplit(url).netloc}); NF_BASE_URL / base_url is the only allowed origin")
+        # Origin and redirects are checked here; the initial robots gate is the
+        # caller's responsibility so _robots() can use _raw_get() to bootstrap.
+
+        current_url = url
+        redirects = 0
         last_error: Exception | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             self._throttle()
+            headers: dict[str, str] = {}
+            if _same_origin(self.cfg.base_url, current_url) and self.cfg.cookie_header:
+                headers["Cookie"] = self.cfg.cookie_header
             try:
-                response = self._http.get(url)
-            except httpx.TooManyRedirects as exc:
-                if self.ledger:
-                    self.ledger.record(path_class, 0, 0, "miss", attempt)
-                raise NetworkError(
-                    f"too many redirects fetching {url}",
-                    hint="this path issues a redirect loop; commands target deep paths",
-                ) from exc
+                response = self._http.get(current_url, headers=headers, follow_redirects=False)
             except httpx.HTTPError as exc:
                 last_error = exc
                 if self.ledger:
-                    self.ledger.record(path_class, 0, 0, "miss", attempt)
+                    self.ledger.record(classify_request(current_url), 0, 0, "miss", attempt)
                 if attempt < MAX_ATTEMPTS:
                     self._sleep(BACKOFF_SECONDS[attempt - 1])
                     continue
-                raise NetworkError(f"request to {url} failed: {exc.__class__.__name__}") from exc
+                raise NetworkError(
+                    f"request to {current_url} failed: {exc.__class__.__name__}") from exc
+
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_BODY_BYTES:
+                raise NetworkError(
+                    f"response body exceeds {MAX_BODY_BYTES} bytes",
+                    hint="the page or shard is larger than this client will fetch")
 
             text = response.text
+            nbytes = len(response.content)
+            if nbytes > MAX_BODY_BYTES:
+                raise NetworkError(
+                    f"response body exceeds {MAX_BODY_BYTES} bytes",
+                    hint="the page or shard is larger than this client will fetch")
+
             if self.ledger:
-                self.ledger.record(path_class, response.status_code,
-                                   len(response.content), "miss", attempt)
+                self.ledger.record(
+                    classify_request(current_url), response.status_code,
+                    nbytes, "miss", attempt)
 
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < MAX_ATTEMPTS:
@@ -202,8 +248,25 @@ class Client:
                     f"request blocked at the edge (status {response.status_code})",
                     hint="the site refused this client; no bypass is attempted")
 
-            return response.status_code, text, attempt
-        raise NetworkError(f"request to {url} failed: {last_error!r}")
+            if response.status_code in (301, 302, 303, 307, 308):
+                loc = response.headers.get("Location")
+                if not loc:
+                    return response.status_code, text, attempt, current_url
+                if redirects >= MAX_REDIRECTS:
+                    raise NetworkError(
+                        f"too many redirects fetching {url}",
+                        hint="this path issues a redirect loop; commands target deep paths")
+                current_url = urljoin(current_url, loc)
+                if not _same_origin(self.cfg.base_url, current_url):
+                    raise UsageError(
+                        f"refusing to fetch a URL outside the configured origin "
+                        f"({urlsplit(current_url).netloc}); NF_BASE_URL / base_url is the only allowed origin")
+                assert_allowed(self._robots(), current_url)
+                redirects += 1
+                continue
+
+            return response.status_code, text, attempt, current_url
+        raise NetworkError(f"request to {current_url} failed: {last_error!r}")
 
     def get(self, url: str, *, no_cache: bool = False, refresh: bool = False) -> FetchResult:
         try:
@@ -214,18 +277,22 @@ class Client:
             if self.ledger:
                 self.ledger.record_refusal(urlsplit(url).path or "/")
             raise
-        path_class = classify_request(url)
 
         if not no_cache and not refresh:
             cached = self._read_cache(url, self.cfg.cache_ttl_s)
             if cached is not None:
+                text, stored_wall = cached
                 if self.ledger:
-                    self.ledger.record(path_class, 200, len(cached.encode("utf-8")), "hit")
+                    self.ledger.record(
+                        classify_request(url), 200,
+                        len(text.encode("utf-8")), "hit")
                 self._last_request = self._clock()
-                return FetchResult(url, 200, cached, True, len(cached.encode("utf-8")))
+                return FetchResult(
+                    url, 200, text, True, len(text.encode("utf-8")),
+                    cache_age_seconds=time.time() - stored_wall)
 
-        status, text, _ = self._raw_get(url, path_class=path_class)
+        status, text, _, final_url = self._raw_get(url)
         if status == 200:
-            self._write_cache(url, text)
+            self._write_cache(final_url, text)
         nbytes = len(text.encode("utf-8"))
         return FetchResult(url, status, text, False, nbytes)

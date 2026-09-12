@@ -1,13 +1,14 @@
 """Sitemap-backed search index.
 
-The site's ``/search/`` is robots-disallowed and is a POST form, so search
-runs against a local index of the site's own sitemap. Slugs carry titles,
+The site\'s ``/search/`` is robots-disallowed and is a POST form, so search
+runs against a local index of the site\'s own sitemap. Slugs carry titles,
 so title search is exact-ish; post bodies are not indexed, and callers must
 not pretend otherwise.
 """
 
 from __future__ import annotations
 
+import io
 import re
 import sqlite3
 import xml.etree.ElementTree as ET
@@ -22,6 +23,7 @@ SITEMAP_INDEX = "/sitemap.xml"
 _SM = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
 INDEXABLE_TYPES = ("thread", "resource", "tag", "forum")
 DEFAULT_SEARCH_TYPES = ("thread", "resource")
+MAX_LIMIT = 200
 
 SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
@@ -45,6 +47,15 @@ def doc_key(row: dict) -> str:
     return f"{row['type']}:{row['id']}"
 
 
+def _is_valid_shard_url(url: str, base_url: str) -> bool:
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    base = urlsplit(base_url)
+    if parts.netloc != base.netloc:
+        return False
+    return re.match(r"^/sitemap-\d+\.xml$", parts.path or "/") is not None
+
+
 def shard_urls(index_xml: str) -> list[tuple[str, str | None]]:
     try:
         root = ET.fromstring(index_xml)
@@ -63,27 +74,32 @@ def shard_urls(index_xml: str) -> list[tuple[str, str | None]]:
 
 def iter_shard(xml_text: str) -> Iterator[dict]:
     """Stream a shard. Shards reach 7.6 MB, so this is iterator-based."""
+    if re.search(r"<!DOCTYPE", xml_text, re.I) or re.search(r"<!ENTITY", xml_text, re.I):
+        raise ParseFailure("sitemap shard contains a DOCTYPE or entity declaration; refusing to parse")
     try:
-        root = ET.fromstring(xml_text)
+        context = ET.iterparse(io.StringIO(xml_text), events=("end",))
+        context = iter(context)
+        event, root = next(context)
     except ET.ParseError as exc:
         raise ParseFailure(f"could not parse a sitemap shard: {exc}") from exc
-    for node in root.iter(f"{_SM}url"):
-        loc = (node.findtext(f"{_SM}loc") or "").strip()
-        if not loc:
-            continue
-        ref = parse_doc_url(loc)
-        if ref is None or ref.type not in INDEXABLE_TYPES:
-            continue
-        if ref.type == "resource" and ref.slug.startswith("categories/"):
-            continue
-        yield {
-            "type": ref.type,
-            "id": ref.id,
-            "slug": ref.slug,
-            "title": slug_to_title(ref.slug.split("/")[-1]),
-            "url": loc,
-            "lastmod": (node.findtext(f"{_SM}lastmod") or "").strip() or None,
-        }
+    for event, node in context:
+        if node.tag == f"{_SM}url":
+            loc = (node.findtext(f"{_SM}loc") or "").strip()
+            if loc:
+                ref = parse_doc_url(loc)
+                if ref is not None and ref.type in INDEXABLE_TYPES:
+                    if not (ref.type == "resource" and ref.slug.startswith("categories/")):
+                        yield {
+                            "type": ref.type,
+                            "id": ref.id,
+                            "slug": ref.slug,
+                            "title": slug_to_title(ref.slug.split("/")[-1]),
+                            "url": loc,
+                            "lastmod": (node.findtext(f"{_SM}lastmod") or "").strip() or None,
+                        }
+            node.clear()
+            if root is not None:
+                root.clear()
 
 
 class Index:
@@ -151,6 +167,7 @@ class Index:
 
     def search(self, query: str, types: Iterable[str] | None = None,
                since: str | None = None, limit: int = 20) -> list[dict]:
+        limit = min(max(limit, 0), MAX_LIMIT)
         tokens = [t for t in re.split(r"\W+", query) if t]
         if not tokens:
             return []
@@ -169,8 +186,10 @@ class Index:
             try:
                 rows = self.conn.execute(
                     sql, [self._fts_query(query, operator), *params, limit]).fetchall()
-            except sqlite3.OperationalError:
-                return []
+            except sqlite3.OperationalError as exc:
+                raise ParseFailure(
+                    f"search query failed: {exc}",
+                    hint=f"the search index may be corrupt; delete {self.path} and re-run nf index")
             if rows:
                 return [
                     {"type": r[0], "id": r[1], "slug": r[2], "title": r[3],
@@ -191,8 +210,7 @@ def build(client, cfg: Config, *, rebuild: bool = False,
     say = progress or (lambda _msg: None)
     index = open_index(cfg)
     try:
-        status, text, _ = client._raw_get(f"{cfg.base_url}{SITEMAP_INDEX}",
-                                          path_class="index")
+        status, text, _, _ = client._raw_get(f"{cfg.base_url}{SITEMAP_INDEX}")
         if status != 200:
             raise ParseFailure(f"sitemap index returned status {status}")
         shards = shard_urls(text)
@@ -200,18 +218,20 @@ def build(client, cfg: Config, *, rebuild: bool = False,
         fetched = skipped = 0
         total = 0
         for url, lastmod in shards:
+            if not _is_valid_shard_url(url, cfg.base_url):
+                say(f"skipping invalid shard URL: {url}")
+                continue
+            client.assert_gated(url)
             if not rebuild and known.get(url) == (lastmod or ""):
                 skipped += 1
                 continue
             say(f"fetching {url}")
-            st, body, _ = client._raw_get(url, path_class="index")
+            st, body, _, _ = client._raw_get(url)
             if st != 200:
                 raise ParseFailure(f"sitemap shard {url} returned status {st}")
-            rows = list(iter_shard(body))
-            index.upsert_many(rows)
+            total += index.upsert_many(iter_shard(body))
             index.set_shard_state(url, lastmod)
             fetched += 1
-            total += len(rows)
         return {"shards": len(shards), "fetched": fetched, "skipped": skipped,
                 "indexed": total, "docs": index.count()}
     finally:

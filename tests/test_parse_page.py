@@ -78,6 +78,21 @@ def test_scrub_attachments_keeps_ordinary_links():
 def test_scrub_attachments_handles_empty_input():
     assert scrub_attachments("") == ""
 
+def test_scrub_attachments_removes_iframes_and_forms():
+    html = ('<p>keep</p><iframe src="/attachments/x.zip.1/"></iframe>'
+            '<form action="/goto/post?id=1"><button>go</button></form>')
+    out = scrub_attachments(html)
+    assert "keep" in out
+    assert "<iframe" not in out
+    assert "<form" not in out
+
+
+def test_scrub_attachments_removes_divs_with_attachment_href_in_any_attribute():
+    html = ('<p>keep</p><div data-href="/attachments/x.zip.1/"><span>bad</span></div>')
+    out = scrub_attachments(html)
+    assert "keep" in out
+    assert "bad" not in out
+
 
 def test_detect_block_recognizes_challenge_page():
     assert detect_block(load("SYNTHETIC-edge-block.html")) is True

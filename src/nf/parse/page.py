@@ -17,7 +17,8 @@ from nf.model import Pagination
 
 # Elements that may carry an attachment or download reference. Removed from
 # any HTML we emit -- the parser must never surface attachment URLs.
-_ATTACHMENT_SELECTORS = ("a", "img", "source", "video", "audio", "object", "embed")
+_ATTACHMENT_SELECTORS = ("a", "img", "source", "video", "audio", "object", "embed",
+                         "iframe", "form", "link", "meta")
 
 _BLOCK_MARKERS = ("just a moment", "attention required", "challenge-platform",
                   "enable javascript and cookies to continue")
@@ -127,11 +128,16 @@ def scrub_attachments(fragment: str) -> str:
         for node in parser.css(selector):
             attrs = node.attributes or {}
             haystack = " ".join(str(v) for v in attrs.values())
-            if "/attachments/" in haystack or "download" in (attrs.get("class") or ""):
+            if "/attachments/" in haystack or "/goto/" in haystack or "download" in haystack:
+                node.decompose()
+                continue
+            if "download" in (attrs.get("class") or ""):
                 node.decompose()
     for node in parser.css("div, span, li, dl"):
-        classes = (node.attributes or {}).get("class") or ""
-        if "attachment" in classes or "downloadButton" in classes:
+        attrs = node.attributes or {}
+        haystack = " ".join(str(v) for v in attrs.values())
+        if ("/attachments/" in haystack or "/goto/" in haystack or "download" in haystack
+                or "attachment" in haystack or "downloadButton" in haystack):
             node.decompose()
     return _body_inner(parser)
 
@@ -149,6 +155,22 @@ def extract_body(node) -> tuple[str, str]:
     safe_tree = HTMLParser(safe_html)
     text = clean_text(safe_tree.body.text() if safe_tree.body else "")
     return safe_html, text
+
+
+def is_safe_url(href: str | None, base_url: str) -> str | None:
+    """Resolve a link and keep it only if it is same-origin and not an attachment/goto path."""
+    if not href:
+        return None
+    url = href if href.startswith("http") else base_url + href
+    from urllib.parse import urlsplit
+    base_parts = urlsplit(base_url)
+    parts = urlsplit(url)
+    if parts.netloc and parts.netloc != base_parts.netloc:
+        return None
+    path = (parts.path or "/").lower()
+    if "/attachments/" in path or "/goto/" in path:
+        return None
+    return url
 
 
 def detect_block(html: str) -> bool:

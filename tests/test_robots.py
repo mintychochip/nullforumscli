@@ -64,8 +64,11 @@ def test_longest_rule_wins():
 
 def test_wildcard_and_anchor():
     p = RobotsPolicy.parse("User-agent: *\nDisallow: /*.json$\n", UA)
+    # The anchor matches the path only, so a query string does not bypass it.
     assert p.is_allowed("/a/b.json") is False
-    assert p.is_allowed("/a/b.json?x=1") is True
+    assert p.is_allowed("/a/b.json?x=1") is False
+    # A path that does not actually end in .json is still allowed.
+    assert p.is_allowed("/a/b.jsonx") is True
 
 
 def test_no_matching_rules_means_allowed():

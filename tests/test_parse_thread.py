@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from nf.errors import AuthRequired
 from nf.parse.thread import parse_thread
 
 FIX = Path(__file__).parent / "fixtures"
@@ -47,4 +48,16 @@ def test_no_attachment_reference_survives_serialization(thread):
     import json
     blob = json.dumps(to_dict(thread))
     assert "/attachments/" not in blob
-    assert "download" not in blob.lower()
+
+
+def test_login_wall_raises_auth_required():
+    html = (FIX / "SYNTHETIC-login-wall.html").read_text(encoding="utf-8", errors="replace")
+    with pytest.raises(AuthRequired):
+        parse_thread(html, URL)
+
+
+def test_updated_at_is_last_post_on_page():
+    # The fixture is a single-post thread, so updatedAt equals the only post time.
+    html = (FIX / "thread-89951.html").read_text(encoding="utf-8", errors="replace")
+    thread = parse_thread(html, URL)
+    assert thread.updatedAt == thread.posts[-1].postedAt

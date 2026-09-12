@@ -9,12 +9,12 @@ import sys
 import typer
 
 from nf.config import Config, load_config
-from nf.errors import NfError, UsageError
+from nf.errors import AuthRequired, NfError, UsageError
 from nf.http import Client
-from nf.index import DEFAULT_SEARCH_TYPES, SITEMAP_INDEX, build, open_index
+from nf.index import DEFAULT_SEARCH_TYPES, MAX_LIMIT, SITEMAP_INDEX, build, open_index
 from nf.model import to_dict
 from nf.parse import parse_listing, parse_resource, parse_thread
-from nf.paths import classify_request
+from nf.parse.page import detect_auth_wall
 from nf.render import render
 from nf.robots import assert_allowed
 from nf.usage import Ledger
@@ -40,8 +40,12 @@ def _config() -> Config:
     return load_config()
 
 
-def _emit(payload, fmt: str, kind: str) -> None:
-    sys.stdout.write(render(payload, fmt, kind))
+def _emit(payload, fmt: str, kind: str, *, from_cache: bool = False,
+          cache_age: float | None = None) -> None:
+    data = payload if isinstance(payload, dict) else to_dict(payload)
+    data["fromCache"] = from_cache
+    data["cacheAgeSeconds"] = cache_age
+    sys.stdout.write(render(data, fmt, kind))
 
 
 def _run(fn):
@@ -70,26 +74,29 @@ def _client(cfg: Config) -> Client:
 def thread(url: str = typer.Argument(None, help="Thread URL, path, or id"),
            id: str = typer.Option(None, "--id", help="Thread id"),
            page: int = typer.Option(1, "--page"),
-           all_pages: bool = typer.Option(False, "--all"),
+           all_pages: bool = typer.Option(False, "--all",
+                                          help="Read all pages sequentially, starting from page 1; ignores --page"),
            format: str = typer.Option("json", "--format", help=FORMAT_HELP)) -> None:
     """Read one thread and its posts."""
     cfg = _config()
     target = _web(url or id or "", "thread", cfg.base_url)
-    if page > 1:
+    if page > 1 and not all_pages:
         sep = "&" if "?" in target else "?"
         target = f"{target}{sep}page={page}"
     with _client(cfg) as client:
         first = client.get(target)
         parsed = parse_thread(first.text, target, cfg.base_url)
         if all_pages and parsed.pagination.pages > 1:
+            base_target = target.split("?")[0]
             for n in range(2, parsed.pagination.pages + 1):
-                sep = "&" if "?" in target else "?"
-                extra = client.get(f"{target}{sep}page={n}")
+                sep = "&" if "?" in base_target else "?"
+                extra = client.get(f"{base_target}{sep}page={n}")
                 more = parse_thread(extra.text, target, cfg.base_url)
                 for offset, post in enumerate(more.posts):
                     post.index = len(parsed.posts) + offset + 1
                 parsed.posts.extend(more.posts)
-        _emit(parsed, format, "thread")
+        _emit(parsed, format, "thread", from_cache=first.from_cache,
+              cache_age=first.cache_age_seconds)
 
 
 @app.command()
@@ -102,7 +109,8 @@ def resource(id: str = typer.Option(None, "--id"),
     target = _web(url or id or "", "resource", cfg.base_url)
     with _client(cfg) as client:
         res = client.get(target)
-        _emit(parse_resource(res.text, target, cfg.base_url), format, "resource")
+        _emit(parse_resource(res.text, target, cfg.base_url), format, "resource",
+              from_cache=res.from_cache, cache_age=res.cache_age_seconds)
 
 
 @app.command()
@@ -119,7 +127,8 @@ def category(id: str = typer.Option(None, "--id"),
         target = f"{target}{sep}page={page}"
     with _client(cfg) as client:
         res = client.get(target)
-        _emit(parse_listing(res.text, target, cfg.base_url), format, "category")
+        _emit(parse_listing(res.text, target, cfg.base_url), format, "category",
+              from_cache=res.from_cache, cache_age=res.cache_age_seconds)
 
 
 @app.command()
@@ -128,16 +137,18 @@ def whoami(format: str = typer.Option("json", "--format", help=FORMAT_HELP)) -> 
     """Report whether the configured session cookie is accepted."""
     cfg = _config()
     if not cfg.cookie:
-        raise NfError("no session cookie is configured",
-                      hint="set NF_COOKIE or cookie = \"...\" in the config file")
+        raise AuthRequired("no session cookie is configured",
+                           hint="set NF_COOKIE or cookie = \"...\" in the config file")
     with _client(cfg) as client:
         res = client.get(f"{cfg.base_url}/members/")
-        from nf.parse.page import detect_auth_wall, tree
-        walled = detect_auth_wall(res.text)
+        if detect_auth_wall(res.text):
+            raise AuthRequired("the site returned a login wall for this URL",
+                               hint="supply a valid session cookie via NF_COOKIE or the config file")
         logged_in = "Log out" in res.text or "js-logOut" in res.text
-        _emit({"authenticated": bool(logged_in and not walled),
-               "loginWall": walled,
-               "cookieConfigured": True}, format, "whoami")
+        _emit({"authenticated": bool(logged_in),
+               "loginWall": False,
+               "cookieConfigured": True}, format, "whoami",
+              from_cache=res.from_cache, cache_age=res.cache_age_seconds)
 
 
 @app.command()
@@ -148,7 +159,6 @@ def raw(url: str = typer.Argument(..., help="URL or path to fetch"),
     cfg = _config()
     target = _web(url, "thread", cfg.base_url)
     with _client(cfg) as client:
-        assert_allowed(client._robots(), target)
         res = client.get(target, refresh=refresh)
         sys.stdout.write(res.text)
 
@@ -164,7 +174,7 @@ def index(rebuild: bool = typer.Option(False, "--rebuild"),
         assert_allowed(client._robots(), f"{cfg.base_url}{SITEMAP_INDEX}")
         stats = build(client, cfg, rebuild=rebuild,
                       progress=None if quiet else lambda m: sys.stderr.write(m + "\n"))
-    _emit(stats, format, "index")
+    _emit(stats, format, "index", from_cache=False, cache_age=None)
 
 
 @app.command()
@@ -179,6 +189,8 @@ def search(query: str = typer.Argument(...),
            format: str = typer.Option("json", "--format", help=FORMAT_HELP)) -> None:
     """Title search over the local sitemap index. Not full-text."""
     cfg = _config()
+    limit = min(max(limit, 0), MAX_LIMIT)
+    resolve = min(max(resolve, 0), MAX_LIMIT)
     types = [t.strip() for t in type.split(",")] if type else list(DEFAULT_SEARCH_TYPES)
     idx = open_index(cfg)
     try:
@@ -191,8 +203,12 @@ def search(query: str = typer.Argument(...),
         idx.close()
 
     if resolve and hits:
+        resolve = min(resolve, len(hits))
         with _client(cfg) as client:
             for hit in hits[:resolve]:
+                if hit["type"] not in ("thread", "resource"):
+                    sys.stderr.write(f"not resolving {hit['type']} hit {hit['url']}\n")
+                    continue
                 page = client.get(hit["url"])
                 parsed = (parse_thread(page.text, hit["url"], cfg.base_url)
                           if hit["type"] == "thread"
@@ -201,8 +217,11 @@ def search(query: str = typer.Argument(...),
                 hit["titleSource"] = "page"
                 key = "thread" if hit["type"] == "thread" else "resource"
                 hit[key] = to_dict(parsed)
+                hit["fromCache"] = page.from_cache
+                hit["cacheAgeSeconds"] = page.cache_age_seconds
 
-    _emit({"query": query, "types": types, "hits": hits}, format, "search")
+    _emit({"query": query, "types": types, "hits": hits}, format, "search",
+          from_cache=False, cache_age=None)
 
 
 @app.command()
@@ -211,7 +230,8 @@ def usage(window: str = typer.Option("24h", "--window", help="1h, 24h, or all"),
           format: str = typer.Option("json", "--format", help=FORMAT_HELP)) -> None:
     """Report this client's own request usage from the local ledger."""
     cfg = _config()
-    _emit(Ledger(cfg.state_dir).rollup(window, limit_ms=cfg.rate_limit_ms), format, "usage")
+    _emit(Ledger(cfg.state_dir).rollup(window, limit_ms=cfg.rate_limit_ms), format, "usage",
+          from_cache=False, cache_age=None)
 
 
 def main() -> None:

@@ -45,3 +45,13 @@ def test_version_is_optional_but_parsed_when_present(listing):
     with_version = [i for i in listing.items if i.version]
     assert with_version
     assert any(i.version == "2026.3.8.4" for i in listing.items)
+
+def test_item_with_attachment_href_yields_none_url():
+    html = '''<li class="structItem-cell--main">
+        <div class="structItem-title">
+            <a href="/attachments/x.zip.1/">X</a>
+        </div>
+    </li>'''
+    listing = parse_listing(html, URL)
+    assert len(listing.items) == 1
+    assert listing.items[0].url is None

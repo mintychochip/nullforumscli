@@ -11,7 +11,9 @@ from nf.parse.page import (
     clean_text,
     extract_body,
     iso_time,
+    is_safe_url,
     require,
+    raise_if_walled,
     title_of,
     tree,
 )
@@ -24,8 +26,10 @@ _TITLE_NOISE = (".label", ".label-append", ".u-muted", ".structItem-resourceTagL
 
 
 def parse_resource(html: str, url: str, base_url: str = "https://nullforums.net") -> Resource:
+    """Parse a resource page."""
     if not html or not html.strip():
         raise ParseFailure("empty response body", hint="try --refresh")
+    raise_if_walled(html)
     t = tree(html)
 
     title_node = t.css_first(".p-title-value")
@@ -47,7 +51,7 @@ def parse_resource(html: str, url: str, base_url: str = "https://nullforums.net"
             author = Author(
                 username=clean_text(link.text()) or None,
                 userId=int(raw_id) if raw_id.isdigit() else None,
-                url=href if href.startswith("http") else (base_url + href if href else None),
+                url=is_safe_url(href, base_url),
             )
 
     category = None
@@ -72,11 +76,12 @@ def parse_resource(html: str, url: str, base_url: str = "https://nullforums.net"
     thread = None
     for link in t.css('a[href*="/threads/"]'):
         href = (link.attributes or {}).get("href") or ""
-        m = re.search(r"\.(\d+)", href)
-        if m:
-            thread = {"id": int(m.group(1)),
-                      "url": href if href.startswith("http") else base_url + href}
-            break
+        safe = is_safe_url(href, base_url)
+        if safe:
+            m = re.search(r"\.(\d+)", href)
+            if m:
+                thread = {"id": int(m.group(1)), "url": safe}
+                break
 
     id_match = _ID_IN_URL.search(url)
     return Resource(

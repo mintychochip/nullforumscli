@@ -9,7 +9,9 @@ from nf.model import Author, ResourceItem, ResourceList
 from nf.parse.page import (
     clean_text,
     iso_time,
+    is_safe_url,
     pagination as read_pagination,
+    raise_if_walled,
     require,
     tree,
 )
@@ -30,7 +32,7 @@ def _item_of(cell, base_url: str) -> ResourceItem | None:
         return None
 
     href = title_link.attributes.get("href") or ""
-    url = href if href.startswith("http") else base_url + href
+    url = is_safe_url(href, base_url)
     id_match = _ID_IN_URL.search(href)
 
     version_node = cell.css_first(".structItem-title .u-muted")
@@ -42,8 +44,7 @@ def _item_of(cell, base_url: str) -> ResourceItem | None:
         author = Author(
             username=clean_text(link.text()) or None,
             userId=int(raw_id) if str(raw_id or "").isdigit() else None,
-            url=(author_href if author_href and author_href.startswith("http")
-                 else (base_url + author_href) if author_href else None),
+            url=is_safe_url(author_href, base_url),
         )
 
     when = cell.css_first("time.u-dt")
@@ -58,8 +59,10 @@ def _item_of(cell, base_url: str) -> ResourceItem | None:
 
 
 def parse_listing(html: str, url: str, base_url: str = "https://nullforums.net") -> ResourceList:
+    """Parse a resource category listing."""
     if not html or not html.strip():
         raise ParseFailure("empty response body", hint="try --refresh")
+    raise_if_walled(html)
     t = tree(html)
     cells = t.css(".structItem-cell--main")
     require(cells, ".structItem-cell--main", hint="no resource items found on this page")

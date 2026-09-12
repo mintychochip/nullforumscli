@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from nf.errors import ParseFailure
 from nf.index import Index, iter_shard, shard_urls
 
 FIX = Path(__file__).parent / "fixtures"
@@ -165,3 +166,28 @@ def test_shard_state_roundtrip(tmp_path):
     idx.set_shard_state("https://nullforums.net/sitemap-1.xml", "2026-09-11T05:37:57+00:00")
     assert idx.shard_state() == {
         "https://nullforums.net/sitemap-1.xml": "2026-09-11T05:37:57+00:00"}
+
+def test_iter_shard_rejects_doctype():
+    xml = '<?xml version="1.0" encoding="UTF-8"?>' \
+          '<!DOCTYPE urlset [<!ELEMENT urlset (url*)>]>' \
+          '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"/>'
+    with pytest.raises(ParseFailure):
+        list(iter_shard(xml))
+
+
+def test_iter_shard_rejects_entity_declaration():
+    xml = '<?xml version="1.0" encoding="UTF-8"?>' \
+          '<!ENTITY x "x">' \
+          '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"/>'
+    with pytest.raises(ParseFailure):
+        list(iter_shard(xml))
+
+
+def test_search_clamps_limit(tmp_path):
+    idx = Index(tmp_path / "i.sqlite")
+    idx.upsert_many([
+        {"type": "thread", "id": i, "slug": f"kit-{i}", "title": f"Kit {i}",
+         "url": f"https://nullforums.net/threads/kit-{i}.{i}/", "lastmod": "2026-01-01"}
+        for i in range(1, 11)
+    ])
+    assert len(idx.search("kit", types=["thread"], since=None, limit=1000)) == 10
