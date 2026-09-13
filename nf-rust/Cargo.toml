@@ -1,0 +1,22 @@
+[package]
+name = "nf"
+version = "0.1.0"
+edition = "2024"
+description = "nullforums.net client: thread/resource reads, likes, downloads, level progress"
+license = "MIT"
+repository = "https://github.com/jlo/nullforumscli"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json", "cookies", "gzip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+scraper = "0.19"
+anyhow = "1"
+regex = "1"
+
+[profile.release]
+strip = true
+lto = true
