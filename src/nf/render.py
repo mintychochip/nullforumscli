@@ -88,12 +88,21 @@ def _usage_md(d: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _likes_md(d: dict) -> str:
+    total = d.get("total", "?")
+    items = d.get("items", [])
+    lines = [f"# Reactions given ({total} total)", "",
+             *(f"- [{it.get('reactedAt')}] {it.get('targetUrl')} — {it.get('targetTitle') or ''}"
+               for it in items)]
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _flat_text(d: dict) -> str:
     return json.dumps(d, indent=2, ensure_ascii=False) + "\n"
 
 
 _MD = {"thread": _thread_md, "resource": _resource_md, "category": _category_md,
-       "search": _search_md, "usage": _usage_md}
+       "search": _search_md, "usage": _usage_md, "likes": _likes_md}
 _TEXT = {"thread": _thread_text}
 
 

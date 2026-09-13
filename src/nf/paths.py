@@ -36,6 +36,8 @@ def classify_request(path: str) -> str:
         return "category"
     if p.startswith("/resources/"):
         return "resource"
+    if p.startswith("/account/") or p.startswith("/posts/") or p.startswith("/dbtech-credits/"):
+        return "account-data"
     if p in ("/sitemap.xml",) or re.match(r"^/sitemap-\d+\.xml$", p):
         return "index"
     if p == "/robots.txt":

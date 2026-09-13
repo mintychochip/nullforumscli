@@ -61,6 +61,9 @@ def test_redact_ignores_short_values_to_avoid_mangling_text():
 
 
 def test_default_user_agent_shape():
+    """nf is no longer strictly read-only (nf like exists), but the UA must
+    stay an honest self-identification in the canonical shape."""
     ua = default_user_agent()
     assert ua.startswith("nf/")
-    assert "read-only" in ua
+    assert "(client; +https://github.com/" in ua
+    assert "read-only" not in ua

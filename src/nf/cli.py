@@ -1,23 +1,33 @@
 """Command line interface. The only place errors become exit codes."""
 
-from __future__ import annotations
-
 import functools
+import hashlib
+import httpx
 import json
+import re
 import sys
+import urllib.parse
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import typer
-
 from nf.config import Config, load_config
-from nf.errors import AuthRequired, NfError, UsageError
+from nf.errors import AuthRequired, NfError, RobotsRefusal, UsageError
 from nf.http import Client
 from nf.index import DEFAULT_SEARCH_TYPES, MAX_LIMIT, SITEMAP_INDEX, build, open_index
-from nf.model import to_dict
+from nf.mutate import do_like
 from nf.parse import parse_listing, parse_resource, parse_thread
-from nf.parse.page import detect_auth_wall
+from nf.model import to_dict
+from nf.parse.account import (
+    parse_account,
+    parse_level_progress,
+    parse_reactions,
+    parse_wallet,
+)
 from nf.render import render
-from nf.robots import assert_allowed
+from nf.robots import RobotsPolicy, assert_allowed
 from nf.usage import Ledger
+
 
 app = typer.Typer(add_completion=False, help="Headless read-only reader for nullforums.net.")
 
@@ -232,6 +242,117 @@ def usage(window: str = typer.Option("24h", "--window", help="1h, 24h, or all"),
     cfg = _config()
     _emit(Ledger(cfg.state_dir).rollup(window, limit_ms=cfg.rate_limit_ms), format, "usage",
           from_cache=False, cache_age=None)
+
+
+@app.command()
+@_run
+def me(format: str = typer.Option("json", "--format", help=FORMAT_HELP)) -> None:
+    """Report the signed-in visitor: identity, wallet, and level progress."""
+    cfg = _config()
+    if not cfg.cookie:
+        raise AuthRequired("no session cookie is configured",
+                           hint="set NF_COOKIE or cookie = \"...\" in the config file")
+    with _client(cfg) as client:
+        res = client.get(f"{cfg.base_url}/dbtech-credits/")
+        account = parse_account(res.text)
+        parse_wallet(res.text, account)
+        if account.userId is None:
+            raise AuthRequired(
+                "could not find the visitor identity block",
+                hint="the session cookie may be stale; re-run nf whoami")
+        lvl = client.get(f"{cfg.base_url}/pages/nullforums-level-system/")
+        progress = parse_level_progress(lvl.text)
+        if progress:
+            account.levelPoints = progress["points"]
+            account.levelPointsNeeded = progress["threshold"]
+            account.levelNext = progress["nextLevel"]
+    # The site's real gates (pulled off /withdraw/): $0.10/upload from L2,
+    # $0.05/update from L3, $10 minimum payout, 50 earning actions/day.
+    level_hint = None
+    if account.levelPoints is not None:
+        if account.levelPoints >= 400:
+            level_hint = "level 2 reached: uploads earn $0.10 each (updates $0.05 from L3)"
+        else:
+            level_hint = (f"level {account.levelNext} in "
+                          f"{account.levelPointsNeeded - account.levelPoints} pts: "
+                          "unlocks $0.10/upload earnings")
+    _emit(to_dict(account) | {"authenticated": True, "levelHint": level_hint}, format, "me")
+
+
+@app.command()
+@_run
+def likes(page: int = typer.Option(1, "--page"),
+          format: str = typer.Option("json", "--format", help=FORMAT_HELP)) -> None:
+    """List reactions the configured session has handed out (one page).
+
+    The only endpoint for this data is /account/reactions-given, and
+    robots.txt Disallows /account/. This command fetches that *exact* path
+    under your own session with an explicit in-code override - the
+    operator inspecting their own data, not crawling. Requires a cookie.
+    """
+    cfg = _config()
+    if not cfg.cookie:
+        raise AuthRequired("no session cookie is configured",
+                           hint="set NF_COOKIE or cookie = \"...\" in the config file")
+    target = f"{cfg.base_url}/account/reactions-given?reaction_id=0"
+    if page > 1:
+        target = f"{target}&page={page}"
+    with _client(cfg) as client:
+        res = client.get_own(target)  # documented override, see http.Client.get_own
+        parsed = parse_reactions(res.text, target, cfg.base_url)
+    _emit(parsed, format, "likes", from_cache=res.from_cache,
+          cache_age=res.cache_age_seconds)
+
+
+@app.command()
+@_run
+def like(target: str = typer.Argument(..., help="Thread/post or resource URL"),
+         format: str = typer.Option("json", "--format", help=FORMAT_HELP)) -> None:
+    """Like a post or resource on the site (one-shot mutation)."""
+    cfg = _config()
+    if not cfg.cookie:
+        raise AuthRequired("no session cookie is configured",
+                           hint="set NF_COOKIE or cookie = \"...\" in the config file")
+    target_url = _web(target, "thread", cfg.base_url)
+    with _client(cfg) as client:
+        result = do_like(client, cfg.base_url, target_url)
+    _emit(result, format, "like", from_cache=False, cache_age=None)
+
+
+@app.command()
+@_run
+def download(url: str = typer.Argument(..., help="Resource URL or id"),
+             out: str = typer.Argument("", help="Output file path"),
+             format: str = typer.Option(None, "--format", help=FORMAT_HELP)) -> None:
+    """Stream a resource file to disk (binary; bypasses the HTML cache)."""
+    cfg = _config()
+    if not cfg.cookie:
+        raise AuthRequired("no session cookie is configured",
+                           hint="set NF_COOKIE or cookie = \"...\" in the config file")
+    base = _web(url, "resource", cfg.base_url)
+    file_url = base.rstrip("/") + "/download"
+    with _client(cfg) as client:
+        dest = Path(out) if out else Path(suggested_filename(client, file_url))
+        result = client.download(file_url, dest)
+    _emit({"url": file_url, "file": str(dest), "bytes": result.nbytes,
+           "sha256": hashlib.sha256(dest.read_bytes()).hexdigest()},
+          format or "json", "download")
+
+
+def suggested_filename(client: Client, file_url: str) -> str:
+    """HEAD the download URL and read filename= from Content-Disposition."""
+    request = client._http.build_request("HEAD", file_url)
+    try:
+        response = client._http.send(request)
+    except httpx.HTTPError as exc:
+        raise NetworkError(f"{exc.__class__.__name__} probing {urlsplit(file_url).path}")
+    disposition = response.headers.get("Content-Disposition", "")
+    m = re.search(r'filename="([^";]+)"|filename=([^;]+)$', disposition)
+    if m:
+        return urllib.parse.unquote((m.group(1) or m.group(2)).strip())
+    slug_m = re.search(r"/resources/([\w\-]+?)(?:\.\d+)?/?$", urlsplit(file_url).path)
+    return (slug_m.group(1) if slug_m else "resource") + ".bin"
+
 
 
 def main() -> None:

@@ -31,8 +31,9 @@ def _package_version() -> str:
 
 
 def default_user_agent() -> str:
-    """Honest, self-identifying UA. Verified to pass the site's gate."""
-    return f"nf/{_package_version()} (read-only client; +https://github.com/{REPO_SLUG})"
+    """Honest, self-identifying UA. Verified to pass the site's edge gate;
+    updated after the CLI grew write operations (like) beyond read-only."""
+    return f"nf/{_package_version()} (client; +https://github.com/{REPO_SLUG})"
 
 
 def _xdg(env: Mapping[str, str], var: str, fallback: str) -> Path:

@@ -20,7 +20,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from nf.config import Config
-from nf.errors import EdgeBlocked, NetworkError, RateLimited, RobotsRefusal, UsageError
+from nf.errors import AuthRequired, EdgeBlocked, NetworkError, RateLimited, RobotsRefusal, UsageError
 from nf.paths import classify_request
 from nf.robots import RobotsPolicy, assert_allowed
 from nf.usage import Ledger
@@ -85,6 +85,13 @@ class Client:
                 "Accept-Language": "en-US,en;q=0.9",
             },
         )
+        if self.cfg.cookie_header:
+            for part in self.cfg.cookie_header.split(";"):
+                name, _, value = part.strip().partition("=")
+                if name:
+                    domain = urlsplit(self.cfg.base_url).hostname
+                    self._http.cookies.set(name, value, domain=domain)
+
         self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.cfg.cache_dir, 0o700)
 
@@ -273,6 +280,32 @@ class Client:
 
             return response.status_code, text, attempt, current_url
         raise NetworkError(f"request to {current_url} failed: {last_error!r}")
+    def get_own(self, url: str) -> FetchResult:
+        """Documented robots override for a strictly own-data path.
+
+        robots.txt Disallows /account/ for crawlers. The only source of the
+        operator's own reaction history lives there, and this client
+        refuses /account/ just as it refuses /search/: mechanically, with
+        no exception baked into the policy parser. The one legitimate use —
+        the operator inspecting their own account under their own session
+        — is therefore expressed as an explicit, opt-in method:
+        get_own() fetches exactly one operator-chosen URL, asserts the
+        path starts with /account/ (so nothing else can ride the
+        override), skips the HTML cache (account pages are session data),
+        and still passes the gate for every other rule.
+        """
+        path = urlsplit(url).path or "/"
+        if not path.startswith("/account/"):
+            raise UsageError("get_own is only for own-account paths: /account/...")
+        if not self.cfg.cookie_header:
+            raise AuthRequired(
+                "own-data fetch requires a session cookie",
+                hint="set NF_COOKIE or cookie = ... in the config file")
+        status, text, attempt, final_url = self._raw_get(url)
+        if self.ledger:
+            self.ledger.record(classify_request(url), status, len(text.encode("utf-8")), "miss", attempt)
+        nbytes = len(text.encode("utf-8"))
+        return FetchResult(url, status, text, False, nbytes)
 
     def get(self, url: str, *, no_cache: bool = False, refresh: bool = False) -> FetchResult:
         try:
@@ -283,7 +316,6 @@ class Client:
             if self.ledger:
                 self.ledger.record_refusal(urlsplit(url).path or "/")
             raise
-
         if not no_cache and not refresh:
             cached = self._read_cache(url, self.cfg.cache_ttl_s)
             if cached is not None:
@@ -302,3 +334,121 @@ class Client:
             self._write_cache(final_url, text)
         nbytes = len(text.encode("utf-8"))
         return FetchResult(url, status, text, False, nbytes)
+
+    def download(self, url: str, dest: Path) -> FetchResult:
+        """Stream a binary resource file to ``dest``.
+
+        The GET cache is HTML-only by design (text decode + 16 MiB cap) and
+        resource files run to hundreds of MB, so this path bypasses the
+        cache entirely and enforces its own size budget. Robots-gated like
+        everything else.
+        """
+        assert_allowed(self._robots(), url)
+        try:
+            self._throttle()
+            headers: dict[str, str] = {}
+            if self.cfg.cookie_header:
+                headers["Cookie"] = self.cfg.cookie_header
+            with self._http.stream(
+                "GET", url, headers=headers, follow_redirects=False, timeout=TIMEOUT_S,
+            ) as response:
+                if response.status_code >= 500 or response.status_code == 429:
+                    raise NetworkError(
+                        f"download returned {response.status_code}",
+                        hint="the download endpoint failed; try again later")
+                ctype = response.headers.get("Content-Type", "")
+                disposition = response.headers.get("Content-Disposition", "")
+                if response.status_code in (403, 503) or _looks_blocked(
+                        response.status_code, ctype):
+                    raise EdgeBlocked(
+                        f"download refused at the edge (status {response.status_code})",
+                        hint="the site returned a block page; the resource may "
+                             "require a Like or a purchase before downloading")
+                if 300 <= response.status_code < 400:
+                    raise NetworkError(
+                        "download redirected more than the client allows",
+                        hint="this file issues a redirect loop")
+                if "text/html" in ctype or not disposition:
+                    # The site answers its like-gate / purchase-gate with a
+                    # 200 HTML page, not an error status: fail before writing.
+                    raise EdgeBlocked(
+                        "download endpoint returned a gate page, not a file",
+                        hint="like the resource first: nf like <resource-url>; "
+                             "then retry the download")
+                nbytes = 0
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest, "wb") as fh:
+                    for chunk in response.iter_bytes(65536):
+                        nbytes += len(chunk)
+                        if nbytes > MAX_BODY_BYTES:
+                            raise NetworkError(
+                                f"download exceeds {MAX_BODY_BYTES} bytes",
+                                hint="the file is larger than this client will fetch")
+                        fh.write(chunk)
+            if self.ledger:
+                self.ledger.record(classify_request(url), 0, nbytes, "miss", 1)
+            return FetchResult(url, response.status_code, "", False, nbytes)
+        except httpx.HTTPError as exc:
+            raise NetworkError(
+                f"download failed: {exc.__class__.__name__}") from exc
+
+    # ---- mutation ----
+
+    def post(self, url: str, data: dict) -> dict:
+        """One gated, throttled, never-cached POST for XenForo AJAX actions.
+
+        The GET cache is HTML-only and keyed by URL: writing a POST response
+        under a GET URL would poison later reads until TTL expiry, so post()
+        never touches the cache. Returns the parsed XenForo JSON envelope.
+        """
+        try:
+            assert_allowed(self._robots(), url)
+        except RobotsRefusal:
+            if self.ledger:
+                self.ledger.record_refusal(urlsplit(url).path or "/")
+            raise
+        headers: dict[str, str] = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            self._throttle()
+            try:
+                response = self._http.post(url, headers=headers, data=data)
+            except httpx.HTTPError as exc:
+                if attempt < MAX_ATTEMPTS:
+                    self._sleep(BACKOFF_SECONDS[attempt - 1])
+                    continue
+                raise NetworkError(
+                    f"POST {urlsplit(url).path} failed: {exc.__class__.__name__}") from exc
+            body = response.text
+            if self.ledger:
+                self.ledger.record("post", response.status_code, len(response.content), "miss", attempt)
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < MAX_ATTEMPTS:
+                    self._sleep(BACKOFF_SECONDS[attempt - 1])
+                    continue
+                raise NetworkError(f"server error {response.status_code} after POST")
+            # XenForo JSON error envelopes arrive on 4xx with an app-level
+            # message (e.g. 403 "You cannot cancel this reaction."); those
+            # are NOT edge blocks and must reach the caller for mapping.
+            ctype = response.headers.get("Content-Type", "")
+            if "application/json" in ctype:
+                try:
+                    return response.json()
+                except ValueError:
+                    pass
+            if _looks_blocked(response.status_code, body):
+                raise EdgeBlocked(
+                    f"request blocked at the edge (status {response.status_code})",
+                    hint="the site refused this client; no bypass is attempted")
+            try:
+                return response.json()
+            except ValueError:
+                if response.status_code >= 400:
+                    raise NetworkError(f"POST {urlsplit(url).path} returned HTTP {response.status_code}",
+                                       hint="the action was refused by the site")
+                return {"status": "ok", "status_code": response.status_code, "text": body}
+        raise NetworkError("POST failed after retries")
