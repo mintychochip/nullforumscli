@@ -14,9 +14,8 @@ The full endpoint surface this client talks to is documented in
 Requires Rust 1.75+.
 
 ```bash
-cd nf-rust
 cargo build --release
-# binary at nf-rust/target/release/nf
+# binary at target/release/nf
 ```
 
 ## Configuration
